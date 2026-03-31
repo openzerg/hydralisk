@@ -5,7 +5,7 @@ let
     pname = "hydralisk";
     version = "1.0.0";
     src = ./.;
-    vendorHash = "sha256-zfZdIeMbnRRex7PZtH2gR/NmUu+iWps2BqNdENVn+cg=";
+    vendorHash = "sha256-QSeG9TlxUIg6Wv5mYELAPfZcA+dbCxmOtqHfsD5JCYE=";
   };
   
   hydralisk-runtime = pkgs.buildEnv {

@@ -74,7 +74,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	dbPath := filepath.Join(homeDir, ".openzerg", "hydralisk.db")
+	dbPath := filepath.Join(homeDir, ".openzerg", "openzerg.db")
 	dbDir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to create database directory:", err)
