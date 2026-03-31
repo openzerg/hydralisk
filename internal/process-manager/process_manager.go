@@ -15,6 +15,24 @@ import (
 	"github.com/openzerg/hydralisk/internal/core/types"
 )
 
+func getBwrapPath() string {
+	candidates := []string{
+		"/run/current-system/sw/bin/bwrap",
+		"/usr/bin/bwrap",
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	if path, err := exec.LookPath("bwrap"); err == nil {
+		return path
+	}
+
+	return "bwrap"
+}
+
 type internalHandle struct {
 	handle   *types.ProcessHandle
 	cmd      *exec.Cmd
@@ -50,41 +68,47 @@ func (pm *ProcessManager) Spawn(ctx context.Context, command string, opts types.
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	args := parseCommand(command)
-	if len(args) == 0 {
-		return nil, fmt.Errorf("empty command")
+	stdoutPath := filepath.Join(outputDir, "stdout")
+	stderrPath := filepath.Join(outputDir, "stderr")
+	exitcodePath := filepath.Join(outputDir, "exitcode")
+
+	workdir := opts.Workdir
+	if workdir == "" {
+		workdir = "/tmp"
 	}
 
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Dir = opts.Workdir
+	bwrapArgs := []string{
+		"--dev-bind", "/", "/",
+		"--proc", "/proc",
+		"--dev", "/dev",
+		"--unshare-pid",
+		"--share-net",
+		"--new-session",
+		"--chdir", workdir,
+		"--setenv", "OPENZERG_PROCESS_ID", processID,
+	}
 
-	env := os.Environ()
-	env = append(env, fmt.Sprintf("OPENZERG_PROCESS_ID=%s", processID))
-	for k, v := range opts.Env {
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	if opts.Env != nil {
+		for k, v := range opts.Env {
+			bwrapArgs = append(bwrapArgs, "--setenv", k, v)
+		}
 	}
-	cmd.Env = env
 
-	stdout, err := os.Create(filepath.Join(outputDir, "stdout.log"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout file: %w", err)
-	}
-	stderr, err := os.Create(filepath.Join(outputDir, "stderr.log"))
-	if err != nil {
-		stdout.Close()
-		return nil, fmt.Errorf("failed to create stderr file: %w", err)
-	}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	bwrapArgs = append(bwrapArgs, "--")
+	wrappedCommand := fmt.Sprintf("(%s) >> %s 2>> %s; echo $? > %s", command, stdoutPath, stderrPath, exitcodePath)
+	bwrapArgs = append(bwrapArgs, "bash", "-lc", wrappedCommand)
+
+	bwrapPath := getBwrapPath()
+	cmd := exec.Command(bwrapPath, bwrapArgs...)
+	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {
-		stdout.Close()
-		stderr.Close()
-		return nil, fmt.Errorf("failed to start process: %w", err)
+		return nil, fmt.Errorf("failed to start bwrap: %w", err)
 	}
 
 	handle := &types.ProcessHandle{
 		ID:        processID,
+		PID:       cmd.Process.Pid,
 		UnitName:  fmt.Sprintf("openzerg-%s.scope", processID[:8]),
 		OutputDir: outputDir,
 		StartedAt: time.Now(),
@@ -95,8 +119,8 @@ func (pm *ProcessManager) Spawn(ctx context.Context, command string, opts types.
 	ih := &internalHandle{
 		handle:   handle,
 		cmd:      cmd,
-		stdout:   stdout,
-		stderr:   stderr,
+		stdout:   nil,
+		stderr:   nil,
 		exitCode: -1,
 		done:     make(chan struct{}),
 	}
@@ -111,10 +135,12 @@ func (pm *ProcessManager) Spawn(ctx context.Context, command string, opts types.
 				ih.exitCode = exitErr.ExitCode()
 			}
 		} else {
-			ih.exitCode = 0
+			if data, err := os.ReadFile(exitcodePath); err == nil {
+				fmt.Sscanf(string(data), "%d", &ih.exitCode)
+			} else {
+				ih.exitCode = 0
+			}
 		}
-		stdout.Close()
-		stderr.Close()
 	}()
 
 	return handle, nil
@@ -170,6 +196,12 @@ func (pm *ProcessManager) Kill(processID, signal string) error {
 		signal = "SIGTERM"
 	}
 
+	select {
+	case <-ih.done:
+		return fmt.Errorf("process already finished")
+	default:
+	}
+
 	return ih.cmd.Process.Signal(parseSignal(signal))
 }
 
@@ -212,13 +244,13 @@ func (pm *ProcessManager) GetOutput(processID string, stream string, offset, lim
 	var filename string
 	switch stream {
 	case "stdout":
-		filename = filepath.Join(ih.handle.OutputDir, "stdout.log")
+		filename = filepath.Join(ih.handle.OutputDir, "stdout")
 	case "stderr":
-		filename = filepath.Join(ih.handle.OutputDir, "stderr.log")
+		filename = filepath.Join(ih.handle.OutputDir, "stderr")
 	case "both":
 		return pm.readBothOutputs(ih.handle, offset, limit)
 	default:
-		filename = filepath.Join(ih.handle.OutputDir, "stdout.log")
+		filename = filepath.Join(ih.handle.OutputDir, "stdout")
 	}
 
 	return pm.readOutputFile(processID, stream, filename, offset, limit)
@@ -256,11 +288,11 @@ func (pm *ProcessManager) readOutputFile(processID, stream, filename string, off
 }
 
 func (pm *ProcessManager) readBothOutputs(handle *types.ProcessHandle, offset, limit int) (*types.ProcessOutput, error) {
-	stdout, err := pm.readOutputFile(handle.ID, "stdout", filepath.Join(handle.OutputDir, "stdout.log"), offset, limit)
+	stdout, err := pm.readOutputFile(handle.ID, "stdout", filepath.Join(handle.OutputDir, "stdout"), offset, limit)
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := pm.readOutputFile(handle.ID, "stderr", filepath.Join(handle.OutputDir, "stderr.log"), offset, limit)
+	stderr, err := pm.readOutputFile(handle.ID, "stderr", filepath.Join(handle.OutputDir, "stderr"), offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -286,8 +318,8 @@ func (pm *ProcessManager) GetOutputStats(processID string) (*types.OutputStats, 
 		return nil, fmt.Errorf("process %s not found", processID)
 	}
 
-	stdoutInfo, _ := os.Stat(filepath.Join(ih.handle.OutputDir, "stdout.log"))
-	stderrInfo, _ := os.Stat(filepath.Join(ih.handle.OutputDir, "stderr.log"))
+	stdoutInfo, _ := os.Stat(filepath.Join(ih.handle.OutputDir, "stdout"))
+	stderrInfo, _ := os.Stat(filepath.Join(ih.handle.OutputDir, "stderr"))
 
 	stdoutSize := int64(0)
 	stderrSize := int64(0)

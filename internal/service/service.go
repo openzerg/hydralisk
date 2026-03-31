@@ -251,8 +251,11 @@ func (p *ProcessService) GetOutput(processID string, stream string, offset, limi
 	return p.procMgr.GetOutput(processID, stream, offset, limit)
 }
 
-func (p *ProcessService) Kill(processID string) error {
-	return p.procMgr.Kill(processID, "SIGTERM")
+func (p *ProcessService) Kill(processID, signal string) error {
+	if signal == "" {
+		signal = "SIGTERM"
+	}
+	return p.procMgr.Kill(processID, signal)
 }
 
 type ToolService struct {

@@ -32,6 +32,7 @@ type Process struct {
 
 type ProcessHandle struct {
 	ID        string    `json:"id"`
+	PID       int       `json:"pid"`
 	UnitName  string    `json:"unit_name"`
 	OutputDir string    `json:"output_dir"`
 	StartedAt time.Time `json:"started_at"`

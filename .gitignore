@@ -1,5 +1,6 @@
 # Binaries
 hydralisk
+hydralisk-test-binary
 target/
 
 # Database files
@@ -8,6 +9,9 @@ target/
 # Data directory
 data/
 
+# Devenv
+.devenv/
+devenv.lock
+
 # Nix
-.direnv/
-result
+result*

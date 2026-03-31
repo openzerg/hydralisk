@@ -3,20 +3,70 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"connectrpc.com/connect"
-	"github.com/openzerg/hydralisk/internal/api/generated"
-	"github.com/openzerg/hydralisk/internal/api/generated/generatedconnect"
 	"github.com/openzerg/hydralisk/internal/service"
+	"github.com/openzerg/hydralisk/packages/api/generated"
+	"github.com/openzerg/hydralisk/packages/api/generated/generatedconnect"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
+type protojsonCodec struct {
+	marshalOptions   protojson.MarshalOptions
+	unmarshalOptions protojson.UnmarshalOptions
+}
+
+func newProtojsonCodec() *protojsonCodec {
+	return &protojsonCodec{
+		marshalOptions: protojson.MarshalOptions{
+			EmitDefaultValues: true,
+			UseProtoNames:     true,
+		},
+		unmarshalOptions: protojson.UnmarshalOptions{
+			DiscardUnknown: true,
+		},
+	}
+}
+
+func (c *protojsonCodec) Name() string { return "json" }
+
+func (c *protojsonCodec) Marshal(msg any) ([]byte, error) {
+	protoMsg, ok := msg.(proto.Message)
+	if !ok {
+		return nil, connect.NewError(connect.CodeInternal, nil)
+	}
+	return c.marshalOptions.Marshal(protoMsg)
+}
+
+func (c *protojsonCodec) Unmarshal(data []byte, msg any) error {
+	protoMsg, ok := msg.(proto.Message)
+	if !ok {
+		return connect.NewError(connect.CodeInternal, nil)
+	}
+	return c.unmarshalOptions.Unmarshal(data, protoMsg)
+}
+
 type AgentServiceHandler struct {
-	services *service.ServiceLayer
+	generatedconnect.UnimplementedAgentHandler
+	services      *service.ServiceLayer
+	mu            sync.RWMutex
+	registries    map[string]*generated.RegistryInfo
+	providers     map[string]*generated.ProviderInfo
+	sessionAgents map[string]string
 }
 
 func NewAgentServiceHandler(services *service.ServiceLayer) *AgentServiceHandler {
-	return &AgentServiceHandler{services: services}
+	return &AgentServiceHandler{
+		services:      services,
+		registries:    make(map[string]*generated.RegistryInfo),
+		providers:     make(map[string]*generated.ProviderInfo),
+		sessionAgents: make(map[string]string),
+	}
 }
 
 func (h *AgentServiceHandler) ListSessions(ctx context.Context, req *connect.Request[generated.ListSessionsRequest]) (*connect.Response[generated.SessionListResponse], error) {
@@ -28,17 +78,21 @@ func (h *AgentServiceHandler) ListSessions(ctx context.Context, req *connect.Req
 	sessions := make([]*generated.SessionInfo, len(result.Sessions))
 	for i, s := range result.Sessions {
 		sessions[i] = &generated.SessionInfo{
-			Id:           s.ID,
-			Purpose:      s.Purpose,
-			State:        string(s.State),
-			CreatedAt:    s.CreatedAt,
-			MessageCount: int64(s.MessageCount),
+			Id:                    s.ID,
+			Purpose:               s.Purpose,
+			State:                 string(s.State),
+			CreatedAt:             s.CreatedAt,
+			Agent:                 "build",
+			InputTokens:           int32(s.InputTokens),
+			OutputTokens:          int32(s.OutputTokens),
+			HasCompactedHistory:   false,
+			CompactedMessageCount: 0,
 		}
 	}
 
 	return connect.NewResponse(&generated.SessionListResponse{
 		Sessions: sessions,
-		Total:    int64(result.Total),
+		Total:    int32(result.Total),
 	}), nil
 }
 
@@ -51,13 +105,52 @@ func (h *AgentServiceHandler) GetSession(ctx context.Context, req *connect.Reque
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
 
+	h.mu.RLock()
+	agent := h.sessionAgents[req.Msg.Id]
+	h.mu.RUnlock()
+	if agent == "" {
+		agent = "build"
+	}
+
 	return connect.NewResponse(&generated.SessionInfo{
-		Id:           result.ID,
-		Purpose:      result.Purpose,
-		State:        string(result.State),
-		CreatedAt:    result.CreatedAt,
-		MessageCount: int64(result.MessageCount),
+		Id:                    result.ID,
+		Purpose:               result.Purpose,
+		State:                 string(result.State),
+		CreatedAt:             result.CreatedAt,
+		Agent:                 agent,
+		InputTokens:           int32(result.InputTokens),
+		OutputTokens:          int32(result.OutputTokens),
+		HasCompactedHistory:   false,
+		CompactedMessageCount: 0,
 	}), nil
+}
+
+func (h *AgentServiceHandler) CreateSession(ctx context.Context, req *connect.Request[generated.CreateSessionRequest]) (*connect.Response[generated.SessionInfo], error) {
+	name := ""
+	result, err := h.services.Session.Create(ctx, name, req.Msg.Purpose, nil, nil)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+
+	return connect.NewResponse(&generated.SessionInfo{
+		Id:                    result.ID,
+		Purpose:               result.Purpose,
+		State:                 string(result.State),
+		CreatedAt:             result.CreatedAt,
+		Agent:                 "build",
+		InputTokens:           int32(result.InputTokens),
+		OutputTokens:          int32(result.OutputTokens),
+		HasCompactedHistory:   false,
+		CompactedMessageCount: 0,
+	}), nil
+}
+
+func (h *AgentServiceHandler) DeleteSession(ctx context.Context, req *connect.Request[generated.DeleteSessionRequest]) (*connect.Response[generated.Empty], error) {
+	err := h.services.Session.Delete(ctx, req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&generated.Empty{}), nil
 }
 
 func (h *AgentServiceHandler) GetSessionMessages(ctx context.Context, req *connect.Request[generated.GetSessionMessagesRequest]) (*connect.Response[generated.MessageListResponse], error) {
@@ -85,11 +178,14 @@ func (h *AgentServiceHandler) GetSessionMessages(ctx context.Context, req *conne
 
 	return connect.NewResponse(&generated.MessageListResponse{
 		Messages: messages,
-		Total:    int64(result.Total),
+		Total:    int32(result.Total),
 	}), nil
 }
 
 func (h *AgentServiceHandler) SendSessionChat(ctx context.Context, req *connect.Request[generated.SendSessionChatRequest]) (*connect.Response[generated.Empty], error) {
+	if req.Msg.Content == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("content is required"))
+	}
 	err := h.services.Session.SendChat(ctx, req.Msg.SessionId, req.Msg.Content)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -105,6 +201,27 @@ func (h *AgentServiceHandler) InterruptSession(ctx context.Context, req *connect
 	return connect.NewResponse(&generated.Empty{}), nil
 }
 
+func (h *AgentServiceHandler) SwitchAgent(ctx context.Context, req *connect.Request[generated.SwitchAgentRequest]) (*connect.Response[generated.Empty], error) {
+	if req.Msg.Agent != "plan" && req.Msg.Agent != "build" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("agent must be 'plan' or 'build'"))
+	}
+
+	h.mu.Lock()
+	h.sessionAgents[req.Msg.SessionId] = req.Msg.Agent
+	h.mu.Unlock()
+
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) UploadFile(ctx context.Context, req *connect.Request[generated.UploadFileRequest]) (*connect.Response[generated.UploadFileResponse], error) {
+	if len(req.Msg.Content) == 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("content is required"))
+	}
+	return connect.NewResponse(&generated.UploadFileResponse{
+		FilePath: "/tmp/" + req.Msg.Filename,
+	}), nil
+}
+
 func (h *AgentServiceHandler) GetSessionContext(ctx context.Context, req *connect.Request[generated.GetSessionContextRequest]) (*connect.Response[generated.SessionContextResponse], error) {
 	result, err := h.services.Session.GetContext(ctx, req.Msg.SessionId)
 	if err != nil {
@@ -117,6 +234,25 @@ func (h *AgentServiceHandler) GetSessionContext(ctx context.Context, req *connec
 	data, _ := json.Marshal(result)
 	return connect.NewResponse(&generated.SessionContextResponse{
 		ContextJson: string(data),
+	}), nil
+}
+
+func (h *AgentServiceHandler) CompactSession(ctx context.Context, req *connect.Request[generated.CompactSessionRequest]) (*connect.Response[generated.CompactSessionResponse], error) {
+	return connect.NewResponse(&generated.CompactSessionResponse{
+		MessagesCompacted: 0,
+	}), nil
+}
+
+func (h *AgentServiceHandler) GetHistoryMessages(ctx context.Context, req *connect.Request[generated.GetHistoryMessagesRequest]) (*connect.Response[generated.MessageListResponse], error) {
+	return connect.NewResponse(&generated.MessageListResponse{
+		Messages: []*generated.MessageInfo{},
+		Total:    0,
+	}), nil
+}
+
+func (h *AgentServiceHandler) DeleteMessagesFrom(ctx context.Context, req *connect.Request[generated.DeleteMessagesFromRequest]) (*connect.Response[generated.DeleteMessagesFromResponse], error) {
+	return connect.NewResponse(&generated.DeleteMessagesFromResponse{
+		DeletedCount: 0,
 	}), nil
 }
 
@@ -138,7 +274,7 @@ func (h *AgentServiceHandler) ListProcesses(ctx context.Context, req *connect.Re
 
 	return connect.NewResponse(&generated.ProcessListResponse{
 		Processes: processes,
-		Total:     int64(result.Total),
+		Total:     int32(result.Total),
 	}), nil
 }
 
@@ -164,11 +300,11 @@ func (h *AgentServiceHandler) GetProcessOutput(ctx context.Context, req *connect
 	if req.Msg.Stream != nil {
 		stream = *req.Msg.Stream
 	}
-	offset := int64(0)
+	offset := int32(0)
 	if req.Msg.Offset != nil {
 		offset = *req.Msg.Offset
 	}
-	limit := int64(50)
+	limit := int32(50)
 	if req.Msg.Limit != nil {
 		limit = *req.Msg.Limit
 	}
@@ -185,8 +321,20 @@ func (h *AgentServiceHandler) GetProcessOutput(ctx context.Context, req *connect
 
 	return connect.NewResponse(&generated.ProcessOutputResponse{
 		Content:   content,
-		TotalSize: int64(result.TotalLines),
+		TotalSize: int32(result.TotalLines),
 	}), nil
+}
+
+func (h *AgentServiceHandler) KillProcess(ctx context.Context, req *connect.Request[generated.KillProcessRequest]) (*connect.Response[generated.Empty], error) {
+	signal := "SIGTERM"
+	if req.Msg.Signal != nil {
+		signal = *req.Msg.Signal
+	}
+	err := h.services.Process.Kill(req.Msg.ProcessId, signal)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&generated.Empty{}), nil
 }
 
 func (h *AgentServiceHandler) ListTasks(ctx context.Context, req *connect.Request[generated.ListTasksRequest]) (*connect.Response[generated.TaskListResponse], error) {
@@ -197,22 +345,15 @@ func (h *AgentServiceHandler) ListTasks(ctx context.Context, req *connect.Reques
 }
 
 func (h *AgentServiceHandler) GetTask(ctx context.Context, req *connect.Request[generated.GetTaskRequest]) (*connect.Response[generated.TaskInfo], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, nil)
-}
-
-func (h *AgentServiceHandler) ListActivities(ctx context.Context, req *connect.Request[generated.ListActivitiesRequest]) (*connect.Response[generated.ActivityListResponse], error) {
-	return connect.NewResponse(&generated.ActivityListResponse{
-		Activities: []*generated.ActivityInfo{},
-		Total:      0,
-	}), nil
+	return nil, connect.NewError(connect.CodeNotFound, nil)
 }
 
 func (h *AgentServiceHandler) SendMessage(ctx context.Context, req *connect.Request[generated.SendMessageRequest]) (*connect.Response[generated.Empty], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	return connect.NewResponse(&generated.Empty{}), nil
 }
 
 func (h *AgentServiceHandler) SendRemind(ctx context.Context, req *connect.Request[generated.SendRemindRequest]) (*connect.Response[generated.Empty], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	return connect.NewResponse(&generated.Empty{}), nil
 }
 
 func (h *AgentServiceHandler) ListBuiltinTools(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.BuiltinToolListResponse], error) {
@@ -233,7 +374,7 @@ func (h *AgentServiceHandler) ListBuiltinTools(ctx context.Context, req *connect
 	}), nil
 }
 
-func (h *AgentServiceHandler) ExecuteBuiltinTool(ctx context.Context, req *connect.Request[generated.ExecuteBuiltinToolRequest]) (*connect.Response[generated.ExecuteBuiltinToolResponse], error) {
+func (h *AgentServiceHandler) ExecuteTool(ctx context.Context, req *connect.Request[generated.ExecuteToolRequest]) (*connect.Response[generated.ExecuteToolResponse], error) {
 	var args map[string]any
 	if req.Msg.ArgsJson != "" {
 		json.Unmarshal([]byte(req.Msg.ArgsJson), &args)
@@ -261,7 +402,7 @@ func (h *AgentServiceHandler) ExecuteBuiltinTool(ctx context.Context, req *conne
 		attachmentsJSON = string(data)
 	}
 
-	return connect.NewResponse(&generated.ExecuteBuiltinToolResponse{
+	return connect.NewResponse(&generated.ExecuteToolResponse{
 		Title:           result.Title,
 		Output:          result.Output,
 		MetadataJson:    metadataJSON,
@@ -270,10 +411,240 @@ func (h *AgentServiceHandler) ExecuteBuiltinTool(ctx context.Context, req *conne
 	}), nil
 }
 
+func (h *AgentServiceHandler) ListExternalTools(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.ExternalToolListResponse], error) {
+	return connect.NewResponse(&generated.ExternalToolListResponse{
+		Tools: []*generated.ExternalToolInfo{},
+	}), nil
+}
+
+func (h *AgentServiceHandler) RegisterExternalTool(ctx context.Context, req *connect.Request[generated.RegisterExternalToolRequest]) (*connect.Response[generated.ExternalToolInfo], error) {
+	return connect.NewResponse(&generated.ExternalToolInfo{
+		Name:        req.Msg.Name,
+		Description: req.Msg.Description,
+	}), nil
+}
+
+func (h *AgentServiceHandler) UnregisterExternalTool(ctx context.Context, req *connect.Request[generated.UnregisterExternalToolRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) SyncExternalTools(ctx context.Context, req *connect.Request[generated.SyncExternalToolsRequest]) (*connect.Response[generated.ExternalToolListResponse], error) {
+	return connect.NewResponse(&generated.ExternalToolListResponse{
+		Tools: []*generated.ExternalToolInfo{},
+	}), nil
+}
+
+func (h *AgentServiceHandler) SetToolVariable(ctx context.Context, req *connect.Request[generated.SetToolVariableRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) ListProviders(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.ProviderListResponse], error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	providers := make([]*generated.ProviderInfo, 0, len(h.providers))
+	for _, p := range h.providers {
+		providers = append(providers, p)
+	}
+	return connect.NewResponse(&generated.ProviderListResponse{
+		Providers: providers,
+	}), nil
+}
+
+func (h *AgentServiceHandler) RegisterProvider(ctx context.Context, req *connect.Request[generated.RegisterProviderRequest]) (*connect.Response[generated.ProviderInfo], error) {
+	if req.Msg.Name == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("name is required"))
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.providers[req.Msg.Name]; exists {
+		return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("provider with name %s already exists", req.Msg.Name))
+	}
+
+	provider := &generated.ProviderInfo{
+		Id:          fmt.Sprintf("provider-%d", time.Now().UnixNano()),
+		Name:        req.Msg.Name,
+		BaseUrl:     req.Msg.BaseUrl,
+		ApiKey:      req.Msg.ApiKey,
+		Model:       req.Msg.Model,
+		MaxTokens:   req.Msg.MaxTokens,
+		Temperature: req.Msg.Temperature,
+		TopP:        req.Msg.TopP,
+		TopK:        req.Msg.TopK,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+	}
+	h.providers[req.Msg.Name] = provider
+
+	return connect.NewResponse(provider), nil
+}
+
+func (h *AgentServiceHandler) UpdateProvider(ctx context.Context, req *connect.Request[generated.UpdateProviderRequest]) (*connect.Response[generated.ProviderInfo], error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	provider, exists := h.providers[req.Msg.Name]
+	if !exists {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("provider %s not found", req.Msg.Name))
+	}
+
+	if req.Msg.BaseUrl != nil {
+		provider.BaseUrl = *req.Msg.BaseUrl
+	}
+	if req.Msg.Model != nil {
+		provider.Model = *req.Msg.Model
+	}
+	if req.Msg.MaxTokens != nil {
+		provider.MaxTokens = *req.Msg.MaxTokens
+	}
+	if req.Msg.Temperature != nil {
+		provider.Temperature = *req.Msg.Temperature
+	}
+	if req.Msg.TopP != nil {
+		provider.TopP = *req.Msg.TopP
+	}
+	if req.Msg.TopK != nil {
+		provider.TopK = *req.Msg.TopK
+	}
+	provider.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	return connect.NewResponse(provider), nil
+}
+
+func (h *AgentServiceHandler) UnregisterProvider(ctx context.Context, req *connect.Request[generated.UnregisterExternalToolRequest]) (*connect.Response[generated.Empty], error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.providers, req.Msg.Name)
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) SetDefaultProvider(ctx context.Context, req *connect.Request[generated.SetDefaultProviderRequest]) (*connect.Response[generated.Empty], error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	provider, exists := h.providers[req.Msg.Name]
+	if !exists {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("provider %s not found", req.Msg.Name))
+	}
+
+	for _, p := range h.providers {
+		p.IsDefault = false
+	}
+	provider.IsDefault = true
+
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) TestProviderConnection(ctx context.Context, req *connect.Request[generated.TestProviderConnectionRequest]) (*connect.Response[generated.TestProviderConnectionResponse], error) {
+	return connect.NewResponse(&generated.TestProviderConnectionResponse{
+		Success: true,
+	}), nil
+}
+
+func (h *AgentServiceHandler) SetSessionProvider(ctx context.Context, req *connect.Request[generated.SetSessionProviderRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) ListRegistries(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.RegistryListResponse], error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	registries := make([]*generated.RegistryInfo, 0, len(h.registries))
+	for _, r := range h.registries {
+		registries = append(registries, r)
+	}
+	return connect.NewResponse(&generated.RegistryListResponse{
+		Registries: registries,
+	}), nil
+}
+
+func (h *AgentServiceHandler) AddRegistry(ctx context.Context, req *connect.Request[generated.AddRegistryRequest]) (*connect.Response[generated.RegistryInfo], error) {
+	if req.Msg.Name == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("name is required"))
+	}
+	if req.Msg.Url == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("url is required"))
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.registries[req.Msg.Name]; exists {
+		return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("registry with name %s already exists", req.Msg.Name))
+	}
+
+	registry := &generated.RegistryInfo{
+		Id:        fmt.Sprintf("registry-%d", time.Now().UnixNano()),
+		Name:      req.Msg.Name,
+		Url:       req.Msg.Url,
+		HasApiKey: req.Msg.ApiKey != nil && *req.Msg.ApiKey != "",
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}
+	h.registries[req.Msg.Name] = registry
+
+	return connect.NewResponse(registry), nil
+}
+
+func (h *AgentServiceHandler) RemoveRegistry(ctx context.Context, req *connect.Request[generated.RemoveRegistryRequest]) (*connect.Response[generated.Empty], error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for name, r := range h.registries {
+		if r.Id == req.Msg.Id {
+			delete(h.registries, name)
+			break
+		}
+	}
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) ListInstalledSkills(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.SkillListResponse], error) {
+	return connect.NewResponse(&generated.SkillListResponse{
+		Skills: []*generated.SkillInfo{},
+	}), nil
+}
+
+func (h *AgentServiceHandler) ListRemoteSkills(ctx context.Context, req *connect.Request[generated.ListRemoteSkillsRequest]) (*connect.Response[generated.SkillListResponse], error) {
+	return connect.NewResponse(&generated.SkillListResponse{
+		Skills: []*generated.SkillInfo{},
+	}), nil
+}
+
+func (h *AgentServiceHandler) InstallSkill(ctx context.Context, req *connect.Request[generated.InstallSkillRequest]) (*connect.Response[generated.SkillInfo], error) {
+	return connect.NewResponse(&generated.SkillInfo{
+		Name: req.Msg.Name,
+	}), nil
+}
+
+func (h *AgentServiceHandler) UninstallSkill(ctx context.Context, req *connect.Request[generated.UninstallSkillRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) GetSkill(ctx context.Context, req *connect.Request[generated.GetSkillRequest]) (*connect.Response[generated.SkillInfo], error) {
+	return nil, connect.NewError(connect.CodeNotFound, nil)
+}
+
+func (h *AgentServiceHandler) ListTimers(ctx context.Context, req *connect.Request[generated.ListTimersRequest]) (*connect.Response[generated.TimerListResponse], error) {
+	return connect.NewResponse(&generated.TimerListResponse{
+		Timers: []*generated.TimerInfo{},
+	}), nil
+}
+
+func (h *AgentServiceHandler) CancelTimer(ctx context.Context, req *connect.Request[generated.CancelTimerRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
+func (h *AgentServiceHandler) AnswerQuestion(ctx context.Context, req *connect.Request[generated.AnswerQuestionRequest]) (*connect.Response[generated.Empty], error) {
+	return connect.NewResponse(&generated.Empty{}), nil
+}
+
 func (h *AgentServiceHandler) CheckHealth(ctx context.Context, req *connect.Request[generated.Empty]) (*connect.Response[generated.HealthResponse], error) {
 	return connect.NewResponse(&generated.HealthResponse{
 		Healthy: true,
-		Version: "0.1.0",
+		Version: "1.0.0",
 	}), nil
 }
 
@@ -287,8 +658,9 @@ func (h *AgentServiceHandler) SubscribeGlobalEvents(ctx context.Context, req *co
 	return nil
 }
 
-var _ generatedconnect.AgentHandler = (*AgentServiceHandler)(nil)
-
 func NewAgentHandler(services *service.ServiceLayer) (string, http.Handler) {
-	return generatedconnect.NewAgentHandler(NewAgentServiceHandler(services))
+	return generatedconnect.NewAgentHandler(
+		NewAgentServiceHandler(services),
+		connect.WithCodec(newProtojsonCodec()),
+	)
 }

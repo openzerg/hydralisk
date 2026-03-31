@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/openzerg/hydralisk/internal/core/interfaces"
 	"github.com/openzerg/hydralisk/internal/core/types"
@@ -71,9 +72,14 @@ func (t *JobTool) runJob(ctx context.Context, args map[string]interface{}, toolC
 	command, _ := args["command"].(string)
 	workdir, _ := args["workdir"].(string)
 	timeout, _ := args["timeout"].(float64)
+	wait, hasWait := args["wait"].(bool)
 
 	if command == "" {
-		return &types.ToolResult{Title: "Error", Output: "command is required", Metadata: map[string]interface{}{"error": true}}, nil
+		return &types.ToolResult{Title: "Error", Output: "command is required for run action", Metadata: map[string]interface{}{"error": true}}, nil
+	}
+
+	if !hasWait {
+		return &types.ToolResult{Title: "Error", Output: "wait parameter is required (must be true or false)", Metadata: map[string]interface{}{"error": true}}, nil
 	}
 
 	if workdir == "" {
@@ -85,15 +91,47 @@ func (t *JobTool) runJob(ctx context.Context, args map[string]interface{}, toolC
 		Timeout: int(timeout),
 	}
 
-	handle, err := pm.Spawn(ctx, command, opts)
+	spawnCtx := ctx
+	if !wait {
+		spawnCtx = context.Background()
+	}
+
+	handle, err := pm.Spawn(spawnCtx, command, opts)
 	if err != nil {
 		return &types.ToolResult{Title: "Error", Output: fmt.Sprintf("Failed to start job: %v", err), Metadata: map[string]interface{}{"error": true}}, nil
 	}
 
+	if wait {
+		result, err := pm.Wait(handle.ID, int(timeout))
+		if err != nil {
+			return &types.ToolResult{Title: "Error", Output: fmt.Sprintf("Failed to wait for job: %v", err), Metadata: map[string]interface{}{"error": true}}, nil
+		}
+		status := "Completed"
+		if result.ExitCode != 0 {
+			status = "Failed"
+		}
+		return &types.ToolResult{
+			Title:  "Job Completed",
+			Output: fmt.Sprintf("Job %s completed.\nExit code: %d\nStatus: %s\nDuration: %dms", handle.ID, result.ExitCode, status, result.DurationMs),
+			Metadata: map[string]interface{}{
+				"job_id":      handle.ID,
+				"pid":         handle.PID,
+				"exit_code":   result.ExitCode,
+				"status":      status,
+				"duration_ms": result.DurationMs,
+			},
+		}, nil
+	}
+
 	return &types.ToolResult{
-		Title:    "Job Started",
-		Output:   fmt.Sprintf("Job %s started in background", handle.ID),
-		Metadata: map[string]interface{}{"job_id": handle.ID},
+		Title:  "Job Started",
+		Output: fmt.Sprintf("Job %s started in background.\n\nTo check output: job(action=\"output\", job_id=\"%s\")", handle.ID, handle.ID),
+		Metadata: map[string]interface{}{
+			"job_id":     handle.ID,
+			"pid":        handle.PID,
+			"output_dir": handle.OutputDir,
+			"started_at": handle.StartedAt.Format(time.RFC3339),
+		},
 	}, nil
 }
 
