@@ -1,0 +1,13 @@
+# Binaries
+hydralisk
+target/
+
+# Database files
+*.db
+
+# Data directory
+data/
+
+# Nix
+.direnv/
+result
